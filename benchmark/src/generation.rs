@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 use text_generation_client::{
-    Batch, ClientError, NextTokenChooserParameters, Request, ShardedClient,
+    Batch, CachedBatch, ClientError, NextTokenChooserParameters, Request, ShardedClient,
     StoppingCriteriaParameters,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
@@ -39,6 +39,7 @@ pub(crate) async fn generation_task(
     decode_length: u32,
     n_runs: usize,
     warmups: usize,
+    parameters: NextTokenChooserParameters,
     client: ShardedClient,
     run_sender: mpsc::Sender<Result<Message, ClientError>>,
     mut shutdown_receiver: broadcast::Receiver<()>,
@@ -47,7 +48,7 @@ pub(crate) async fn generation_task(
     // End task if a message is received on shutdown_receiver
     // _shutdown_guard_sender will be dropped once the task is finished
     tokio::select! {
-        res = generate_runs(tokenizer, batch_size, sequence_length, decode_length, n_runs, warmups, client, run_sender.clone())  => {
+        res = generate_runs(tokenizer, batch_size, sequence_length, decode_length, n_runs, warmups, parameters, client, run_sender.clone())  => {
             if let Err(err) = res {
                 run_sender.send(Err(err)).await.unwrap_or(());
             }
@@ -65,6 +66,7 @@ async fn generate_runs(
     decode_length: u32,
     n_runs: usize,
     warmups: usize,
+    parameters: NextTokenChooserParameters,
     mut client: ShardedClient,
     run_sender: mpsc::Sender<Result<Message, ClientError>>,
 ) -> Result<(), ClientError> {
@@ -79,6 +81,7 @@ async fn generate_runs(
                 sequence_length,
                 b,
                 decode_length,
+                parameters.clone(),
                 &mut client,
             )
             .await?;
@@ -93,6 +96,7 @@ async fn generate_runs(
                 sequence_length,
                 b,
                 decode_length,
+                parameters.clone(),
                 &mut client,
             )
             .await?;
@@ -125,24 +129,16 @@ async fn prefill(
     sequence_length: u32,
     batch_size: u32,
     decode_length: u32,
+    parameters: NextTokenChooserParameters,
     client: &mut ShardedClient,
-) -> Result<(Prefill, Batch), ClientError> {
+) -> Result<(Prefill, CachedBatch), ClientError> {
     // Create requests
     let requests = (0..batch_size)
         .map(|id| Request {
             id: id.into(),
             inputs: sequence.clone(),
             truncate: sequence_length,
-            parameters: Some(NextTokenChooserParameters {
-                temperature: 1.0,
-                top_k: 0,
-                top_p: 1.0,
-                typical_p: 1.0,
-                do_sample: false,
-                seed: 0,
-                repetition_penalty: 1.0,
-                watermark: false,
-            }),
+            parameters: Some(parameters.clone()),
             stopping_parameters: Some(StoppingCriteriaParameters {
                 max_new_tokens: decode_length,
                 stop_sequences: vec![],
@@ -180,7 +176,7 @@ async fn prefill(
 }
 
 /// Run a full decode
-async fn decode(batch: Batch, client: &mut ShardedClient) -> Result<Decode, ClientError> {
+async fn decode(batch: CachedBatch, client: &mut ShardedClient) -> Result<Decode, ClientError> {
     let mut decode_length = 0;
     let batch_size = batch.size;
 

@@ -39,19 +39,29 @@ class BloomCausalLMBatch(CausalLMBatch):
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        dtype: torch.dtype,
         device: torch.device,
     ) -> "CausalLMBatch":
         batch = super(BloomCausalLMBatch, cls).from_pb(
-            pb=pb, tokenizer=tokenizer, device=device
+            pb=pb, tokenizer=tokenizer, dtype=dtype, device=device
         )
         batch.keys_head_dim_last = False
         return batch
 
 
 class BLOOM(CausalLM):
-    def __init__(self, model_id: str, revision: Optional[str] = None, quantize=False):
+    def __init__(
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
+    ):
         super(BLOOM, self).__init__(
-            model_id=model_id, revision=revision, quantize=quantize, decode_buffer=1
+            model_id=model_id,
+            revision=revision,
+            quantize=quantize,
+            trust_remote_code=trust_remote_code,
         )
 
     @property
@@ -61,10 +71,13 @@ class BLOOM(CausalLM):
 
 class BLOOMSharded(BLOOM):
     def __init__(
-        self, model_id: str, revision: Optional[str] = None, quantize: bool = False
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
         self.process_group, rank, world_size = initialize_torch_distributed()
-        self.master = rank == 0
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16
@@ -73,11 +86,19 @@ class BLOOMSharded(BLOOM):
             dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, revision=revision, padding_side="left", truncation_side="left"
+            model_id,
+            revision=revision,
+            padding_side="left",
+            truncation_side="left",
+            trust_remote_code=trust_remote_code,
         )
 
         config = AutoConfig.from_pretrained(
-            model_id, revision=revision, slow_but_exact=False, tp_parallel=True
+            model_id,
+            revision=revision,
+            slow_but_exact=False,
+            tp_parallel=True,
+            trust_remote_code=trust_remote_code,
         )
         config.pad_token_id = 3
 
@@ -85,7 +106,9 @@ class BLOOMSharded(BLOOM):
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config)
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=trust_remote_code
+            )
 
         torch.distributed.barrier(group=self.process_group)
         self.load_weights(
@@ -97,14 +120,13 @@ class BLOOMSharded(BLOOM):
             rank=rank,
             world_size=world_size,
         )
-        self.model = model.eval()
         torch.distributed.barrier(group=self.process_group)
         super(CausalLM, self).__init__(
+            model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
             device=device,
-            decode_buffer=1,
             rank=rank,
             world_size=world_size,
         )
@@ -113,7 +135,7 @@ class BLOOMSharded(BLOOM):
     def load_weights(
         model,
         filenames: List[str],
-        quantize: bool,
+        quantize: Optional[str],
         device: torch.device,
         dtype: torch.dtype,
         rank: int,
@@ -122,10 +144,13 @@ class BLOOMSharded(BLOOM):
         parameters = dict(model.named_parameters())
         for file in filenames:
             with safe_open(
-                file, framework="pt", device=str(device) if not quantize else "cpu"
+                file, framework="pt", device=str(device) if quantize is None else "cpu"
             ) as f:
                 for name in f.keys():
-                    full_name = f"transformer.{name}"
+                    if name.startswith("transformer.") or name.startswith("lm_head."):
+                        full_name = name
+                    else:
+                        full_name = f"transformer.{name}"
 
                     module_name, param_name = full_name.rsplit(".", 1)
                     module = model.get_submodule(module_name)
@@ -151,7 +176,10 @@ class BLOOMSharded(BLOOM):
                             # XXX: Hack for Rowlinear to add the bias only once.
                             if rank != 0:
                                 tensor = torch.zeros_like(tensor)
-                    elif isinstance(module, TensorParallelEmbedding):
+                    elif (
+                        isinstance(module, TensorParallelEmbedding)
+                        or name == "lm_head.weight"
+                    ):
                         size = slice_.get_shape()[0]
                         block_size = size // world_size
                         start = rank * block_size
@@ -167,7 +195,7 @@ class BLOOMSharded(BLOOM):
 
                     tensor = tensor.contiguous().to(dtype)
 
-                    if quantize:
+                    if quantize == "bitsandbytes":
                         if not HAS_BITS_AND_BYTES:
                             raise ImportError(
                                 "bitsandbytes is not available on your machine either because it is not installed "
@@ -217,22 +245,16 @@ class BLOOMSharded(BLOOM):
                                 return linear
 
                             module.linear = replace_linear(state)
-
-                        else:
-                            tensor = tensor.to(device)
+                    elif quantize == "gptq":
+                        raise NotImplementedError("`gptq` is not implemented for now")
+                    elif quantize is None:
+                        tensor = tensor.to(device)
+                    else:
+                        raise ValueError(f"Unexpected quantize `{quantize}`")
 
                     module._parameters[param_name] = tensor
                     if name == "word_embeddings.weight":
                         model.lm_head._parameters["weight"] = tensor
-
-        uninitialized_parameters = []
-        for n, p in model.named_parameters():
-            if p.data.device == torch.device("meta"):
-                uninitialized_parameters.append(n)
-        if uninitialized_parameters:
-            raise RuntimeError(
-                f"found uninitialized parameters in model: {uninitialized_parameters}"
-            )
 
     def forward(
         self, input_ids, attention_mask, position_ids, past_key_values: Optional = None

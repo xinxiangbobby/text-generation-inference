@@ -1,4 +1,5 @@
 import torch
+import inspect
 
 from dataclasses import dataclass
 from opentelemetry import trace
@@ -35,8 +36,8 @@ class CausalLMBatch(Batch):
 
     # Lengths of all generations present in the batch
     input_lengths: List[int]
-    offsets: List[Optional[int]]
-    token_offsets: List[Optional[int]]
+    prefix_offsets: List[int]
+    read_offsets: List[int]
 
     # Generation helpers
     next_token_choosers: List[NextTokenChooser]
@@ -52,10 +53,10 @@ class CausalLMBatch(Batch):
     # Past metadata
     keys_head_dim_last: bool = True
 
-    def to_pb(self) -> generate_pb2.Batch:
-        return generate_pb2.Batch(
+    def to_pb(self) -> generate_pb2.CachedBatch:
+        return generate_pb2.CachedBatch(
             id=self.batch_id,
-            requests=self.requests,
+            request_ids=[r.id for r in self.requests],
             size=len(self),
             max_tokens=self.max_tokens,
         )
@@ -65,13 +66,14 @@ class CausalLMBatch(Batch):
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        dtype: torch.dtype,
         device: torch.device,
     ) -> "CausalLMBatch":
         inputs = []
         next_token_choosers = []
         stopping_criterias = []
-        offsets = []
-        token_offsets = []
+        prefix_offsets = []
+        read_offsets = []
         requests_idx_mapping = {}
 
         # Parse batch
@@ -81,8 +83,6 @@ class CausalLMBatch(Batch):
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
             inputs.append(r.inputs)
-            offsets.append(None)
-            token_offsets.append(None)
             next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
             stopping_criteria = StoppingCriteria.from_pb(
                 r.stopping_parameters, tokenizer
@@ -102,6 +102,10 @@ class CausalLMBatch(Batch):
             truncation=True,
             max_length=max_truncation,
         ).to(device)
+        for _ in pb.requests:
+            input_len = tokenized_inputs["input_ids"].shape[1]
+            prefix_offsets.append(0)
+            read_offsets.append(input_len)
 
         input_lengths = tokenized_inputs["attention_mask"].sum(1)
         max_input_length = input_lengths.max()
@@ -130,8 +134,8 @@ class CausalLMBatch(Batch):
             past_key_values=None,
             all_input_ids=list(all_input_ids),
             input_lengths=input_lengths.tolist(),
-            offsets=offsets,
-            token_offsets=token_offsets,
+            prefix_offsets=prefix_offsets,
+            read_offsets=read_offsets,
             next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
             max_input_length=max_input_length.item(),
@@ -140,19 +144,20 @@ class CausalLMBatch(Batch):
         )
 
     @tracer.start_as_current_span("filter")
-    def filter(self, requests: List[generate_pb2.Request]) -> Optional["CausalLMBatch"]:
-        if len(requests) == 0:
+    def filter(self, request_ids: List[int]) -> Optional["CausalLMBatch"]:
+        if len(request_ids) == 0:
             raise ValueError("Batch must have at least one request")
-        if len(requests) == len(self):
+        if len(request_ids) == len(self):
             return self
 
         keep_indices = []
 
         # New values after filtering
         requests_idx_mapping = {}
+        requests = []
         input_lengths = []
-        offsets = []
-        token_offsets = []
+        prefix_offsets = []
+        read_offsets = []
         all_input_ids = []
         max_input_length = 0
 
@@ -162,13 +167,14 @@ class CausalLMBatch(Batch):
         total_remaining_decode_tokens = 0
         new_padding_right_offset = 0
 
-        for i, r in enumerate(requests):
-            idx = self.requests_idx_mapping[r.id]
-            requests_idx_mapping[r.id] = i
+        for i, request_id in enumerate(request_ids):
+            idx = self.requests_idx_mapping[request_id]
+            requests_idx_mapping[request_id] = i
             keep_indices.append(idx)
 
-            offsets.append(self.offsets[idx])
-            token_offsets.append(self.token_offsets[idx])
+            requests.append(self.requests[idx])
+            prefix_offsets.append(self.prefix_offsets[idx])
+            read_offsets.append(self.read_offsets[idx])
             all_input_ids.append(self.all_input_ids[idx])
 
             request_input_length = self.input_lengths[idx]
@@ -217,7 +223,7 @@ class CausalLMBatch(Batch):
             layer[1] = past_values[keep_indices, :, -past_kv_length:, :]
             del past_values
 
-        max_tokens = len(requests) * max_input_length + total_remaining_decode_tokens
+        max_tokens = len(request_ids) * max_input_length + total_remaining_decode_tokens
 
         self.requests = requests
         self.requests_idx_mapping = requests_idx_mapping
@@ -225,8 +231,8 @@ class CausalLMBatch(Batch):
         self.position_ids = position_ids
         self.all_input_ids = all_input_ids
         self.input_lengths = input_lengths
-        self.offsets = offsets
-        self.token_offsets = token_offsets
+        self.prefix_offsets = prefix_offsets
+        self.read_offsets = read_offsets
         self.next_token_choosers = next_token_choosers
         self.stopping_criterias = stopping_criterias
         self.max_input_length = max_input_length
@@ -251,8 +257,8 @@ class CausalLMBatch(Batch):
         requests = []
         requests_idx_mapping = {}
         input_lengths = []
-        offsets = []
-        token_offsets = []
+        prefix_offsets = []
+        read_offsets = []
         all_input_ids = []
         next_token_choosers = []
         stopping_criterias = []
@@ -270,8 +276,8 @@ class CausalLMBatch(Batch):
         for i, batch in enumerate(batches):
             requests.extend(batch.requests)
             input_lengths.extend(batch.input_lengths)
-            offsets.extend(batch.offsets)
-            token_offsets.extend(batch.token_offsets)
+            prefix_offsets.extend(batch.prefix_offsets)
+            read_offsets.extend(batch.read_offsets)
             all_input_ids.extend(batch.all_input_ids)
             next_token_choosers.extend(batch.next_token_choosers)
             stopping_criterias.extend(batch.stopping_criterias)
@@ -428,8 +434,8 @@ class CausalLMBatch(Batch):
             past_key_values=past_key_values,
             all_input_ids=all_input_ids,
             input_lengths=input_lengths,
-            offsets=offsets,
-            token_offsets=token_offsets,
+            prefix_offsets=prefix_offsets,
+            read_offsets=read_offsets,
             next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
             max_input_length=max_input_length,
@@ -447,8 +453,8 @@ class CausalLM(Model):
         self,
         model_id: str,
         revision: Optional[str] = None,
-        quantize: bool = False,
-        decode_buffer: int = 3,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -461,27 +467,46 @@ class CausalLM(Model):
             dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, revision=revision, padding_side="left", truncation_side="left"
+            model_id,
+            revision=revision,
+            padding_side="left",
+            truncation_side="left",
+            trust_remote_code=trust_remote_code,
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-            load_in_8bit=quantize,
-        ).eval()
-        tokenizer.pad_token_id = (
-            self.model.config.pad_token_id
-            if self.model.config.pad_token_id is not None
-            else self.model.config.eos_token_id
+            device_map="auto"
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1
+            else None,
+            load_in_8bit=quantize == "bitsandbytes",
+            trust_remote_code=trust_remote_code,
+        )
+        if torch.cuda.is_available() and torch.cuda.device_count() == 1:
+            model = model.cuda()
+
+        if tokenizer.pad_token_id is None:
+            if model.config.pad_token_id is not None:
+                tokenizer.pad_token_id = model.config.pad_token_id
+            elif model.config.eos_token_id is not None:
+                tokenizer.pad_token_id = model.config.eos_token_id
+            elif tokenizer.eos_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            else:
+                tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        self.has_position_ids = (
+            inspect.signature(model.forward).parameters.get("position_ids", None)
+            is not None
         )
 
         super(CausalLM, self).__init__(
+            model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
             device=device,
-            decode_buffer=decode_buffer,
         )
 
     @property
@@ -497,13 +522,17 @@ class CausalLM(Model):
         self, input_ids, attention_mask, position_ids, past_key_values: Optional = None
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         # Model Forward
-        outputs = self.model.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if self.has_position_ids:
+            kwargs["position_ids"] = position_ids
+
+        outputs = self.model.forward(**kwargs)
         return outputs.logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
@@ -528,8 +557,8 @@ class CausalLM(Model):
         iterator = zip(
             batch.requests,
             batch.input_lengths,
-            batch.offsets,
-            batch.token_offsets,
+            batch.prefix_offsets,
+            batch.read_offsets,
             logits,
             batch.next_token_choosers,
             batch.stopping_criterias,
@@ -540,8 +569,8 @@ class CausalLM(Model):
         for i, (
             request,
             input_length,
-            offset,
-            token_offset,
+            prefix_offset,
+            read_offset,
             logits,
             next_token_chooser,
             stopping_criteria,
@@ -559,8 +588,8 @@ class CausalLM(Model):
             # Generated token
             next_token_logprob = logprobs[-1, next_token_id]
             next_token_id_squeezed = next_token_id.squeeze()
-            next_token_text, offset, token_offset = self.decode_token(
-                all_input_ids[:, 0], offset, token_offset
+            next_token_text, prefix_offset, read_offset = self.decode_token(
+                all_input_ids[:, 0], prefix_offset, read_offset
             )
 
             # Evaluate stopping criteria
@@ -628,8 +657,8 @@ class CausalLM(Model):
             batch.input_ids[i, 0] = next_token_id
             batch.all_input_ids[i] = all_input_ids
             batch.input_lengths[i] = new_input_length
-            batch.offsets[i] = offset
-            batch.token_offsets[i] = token_offset
+            batch.prefix_offsets[i] = prefix_offset
+            batch.read_offsets[i] = read_offset
             batch.max_input_length = max(batch.max_input_length, new_input_length)
 
         # We finished all generations in the batch; there is no next batch

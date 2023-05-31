@@ -42,7 +42,7 @@ def default_pb_batch(default_pb_request):
 @pytest.fixture
 def default_seq2seq_lm_batch(default_pb_batch, mt0_small_tokenizer):
     return Seq2SeqLMBatch.from_pb(
-        default_pb_batch, mt0_small_tokenizer, torch.device("cpu")
+        default_pb_batch, mt0_small_tokenizer, torch.float32, torch.device("cpu")
     )
 
 
@@ -55,7 +55,9 @@ def default_multi_requests_seq2seq_lm_batch(default_pb_request, mt0_small_tokeni
     req_1.stopping_parameters.max_new_tokens = 5
 
     batch_pb = generate_pb2.Batch(id=0, requests=[req_0, req_1], size=2)
-    return Seq2SeqLMBatch.from_pb(batch_pb, mt0_small_tokenizer, torch.device("cpu"))
+    return Seq2SeqLMBatch.from_pb(
+        batch_pb, mt0_small_tokenizer, torch.float32, torch.device("cpu")
+    )
 
 
 def test_batch_from_pb(default_pb_batch, default_seq2seq_lm_batch):
@@ -149,7 +151,7 @@ def test_seq2seq_lm_generate_token(default_seq2seq_lm, default_seq2seq_lm_batch)
     assert all([generation.generated_text is None for generation in generations])
     assert all([len(generation.prefill_tokens) == 1 for generation in generations])
     assert all([generation.token_id.item() == 259 for generation in generations])
-    assert all([generation.token_text == "" for generation in generations])
+    assert all([generation.token_text == " " for generation in generations])
     assert generations[0].request_id == 0
 
 
@@ -190,7 +192,7 @@ def test_seq2seq_lm_generate_token_completion_multi(
     )
     assert generations[1].generated_text.generated_tokens == 5
 
-    next_batch = next_batch.filter([next_batch.requests[0]])
+    next_batch = next_batch.filter([next_batch.requests[0].id])
 
     generations, next_batch = default_seq2seq_lm.generate_token(next_batch)
     assert len(generations) == len(next_batch)
@@ -323,7 +325,9 @@ def test_batch_concatenate(
     )
     assert generations[2].generated_text.generated_tokens == 5
 
-    next_batch = next_batch.filter([next_batch.requests[0], next_batch.requests[1]])
+    next_batch = next_batch.filter(
+        [next_batch.requests[0].id, next_batch.requests[1].id]
+    )
 
     generations, next_batch = default_seq2seq_lm.generate_token(next_batch)
     assert next_batch is not None
@@ -333,7 +337,7 @@ def test_batch_concatenate(
     assert generations[0].request_id == default_seq2seq_lm_batch.requests[0].id
     assert generations[0].generated_text.generated_tokens == 7
 
-    next_batch = next_batch.filter([next_batch.requests[1]])
+    next_batch = next_batch.filter([next_batch.requests[1].id])
 
     generations, next_batch = default_seq2seq_lm.generate_token(next_batch)
     assert next_batch is None

@@ -42,22 +42,20 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             self.cache.delete(request.id)
         else:
             self.cache.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         return generate_pb2.ClearCacheResponse()
 
     async def FilterBatch(self, request, context):
         batch = self.cache.pop(request.batch_id)
         if batch is None:
             raise ValueError(f"Batch ID {request.batch_id} not found in cache.")
-        filtered_batch = batch.filter(request.keep_requests)
+        filtered_batch = batch.filter(request.request_ids)
         self.cache.set(filtered_batch)
 
         return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
 
     async def Prefill(self, request, context):
         batch = self.model.batch_type.from_pb(
-            request.batch, self.model.tokenizer, self.model.device
+            request.batch, self.model.tokenizer, self.model.dtype, self.model.device
         )
 
         generations, next_batch = self.model.generate_token(batch)
@@ -100,14 +98,16 @@ def serve(
     model_id: str,
     revision: Optional[str],
     sharded: bool,
-    quantize: bool,
+    quantize: Optional[str],
+    trust_remote_code: bool,
     uds_path: Path,
 ):
     async def serve_inner(
         model_id: str,
         revision: Optional[str],
         sharded: bool = False,
-        quantize: bool = False,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
         unix_socket_template = "unix://{}-{}"
         if sharded:
@@ -121,7 +121,7 @@ def serve(
             server_urls = [local_url]
 
         try:
-            model = get_model(model_id, revision, sharded, quantize)
+            model = get_model(model_id, revision, sharded, quantize, trust_remote_code)
         except Exception:
             logger.exception("Error when initializing model")
             raise
@@ -152,4 +152,4 @@ def serve(
             logger.info("Signal received. Shutting down")
             await server.stop(0)
 
-    asyncio.run(serve_inner(model_id, revision, sharded, quantize))
+    asyncio.run(serve_inner(model_id, revision, sharded, quantize, trust_remote_code))

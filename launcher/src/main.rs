@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
@@ -15,6 +15,26 @@ use std::{fs, io};
 use subprocess::{ExitStatus, Popen, PopenConfig, PopenError, Redirection};
 
 mod env_runtime;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Quantization {
+    Bitsandbytes,
+    Gptq,
+}
+
+impl std::fmt::Display for Quantization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // To keep in track with `server`.
+        match self {
+            Quantization::Bitsandbytes => {
+                write!(f, "bitsandbytes")
+            }
+            Quantization::Gptq => {
+                write!(f, "gptq")
+            }
+        }
+    }
+}
 
 /// App Configuration
 #[derive(Parser, Debug)]
@@ -33,7 +53,7 @@ struct Args {
     #[clap(long, env)]
     revision: Option<String>,
 
-    /// Wether to shard or not the model across multiple GPUs
+    /// Whether to shard the model across multiple GPUs
     /// By default text-generation-inference will use all available GPUs to run
     /// the model. Setting it to `false` deactivates `num_shard`.
     #[clap(long, env)]
@@ -46,10 +66,16 @@ struct Args {
     #[clap(long, env)]
     num_shard: Option<usize>,
 
-    /// Wether you want the model to be quantized or not. This will use bitsandbytes for
-    /// quantization on the fly.
-    #[clap(long, env)]
-    quantize: bool,
+    /// Whether you want the model to be quantized. This will use `bitsandbytes` for
+    /// quantization on the fly, or `gptq`.
+    #[clap(long, env, value_enum)]
+    quantize: Option<Quantization>,
+
+    /// Whether you want to execute hub modelling code. Explicitly passing a `revision` is
+    /// encouraged when loading a model with custom code to ensure no malicious code has been
+    /// contributed in a newer revision.
+    #[clap(long, env, value_enum)]
+    trust_remote_code: bool,
 
     /// The maximum amount of concurrent requests for this particular deployment.
     /// Having a low limit will refuse clients requests instead of having them
@@ -218,7 +244,8 @@ enum ShardStatus {
 fn shard_manager(
     model_id: String,
     revision: Option<String>,
-    quantize: bool,
+    quantize: Option<Quantization>,
+    trust_remote_code: bool,
     uds_path: String,
     rank: usize,
     world_size: usize,
@@ -252,13 +279,19 @@ fn shard_manager(
         "--json-output".to_string(),
     ];
 
+    // Activate trust remote code
+    if trust_remote_code {
+        shard_argv.push("--trust-remote-code".to_string());
+    }
+
     // Activate tensor parallelism
     if world_size > 1 {
         shard_argv.push("--sharded".to_string());
     }
 
-    if quantize {
-        shard_argv.push("--quantize".to_string())
+    if let Some(quantize) = quantize {
+        shard_argv.push("--quantize".to_string());
+        shard_argv.push(quantize.to_string())
     }
 
     // Model optional revision
@@ -422,11 +455,12 @@ fn shutdown_shards(shutdown: Arc<Mutex<bool>>, shutdown_receiver: &mpsc::Receive
 }
 
 fn num_cuda_devices() -> Option<usize> {
-    if let Ok(cuda_visible_devices) = env::var("CUDA_VISIBLE_DEVICES") {
-        let n_devices = cuda_visible_devices.split(',').count();
-        return Some(n_devices);
-    }
-    None
+    let devices = match env::var("CUDA_VISIBLE_DEVICES") {
+        Ok(devices) => devices,
+        Err(_) => env::var("NVIDIA_VISIBLE_DEVICES").ok()?,
+    };
+    let n_devices = devices.split(',').count();
+    Some(n_devices)
 }
 
 #[derive(Deserialize)]
@@ -476,9 +510,9 @@ fn find_num_shards(sharded: Option<bool>, num_shard: Option<usize>) -> usize {
     let num_shard = match (sharded, num_shard) {
         (Some(true), None) => {
             // try to default to the number of available GPUs
-            tracing::info!("Parsing num_shard from CUDA_VISIBLE_DEVICES");
-            let n_devices =
-                num_cuda_devices().expect("--num-shard and CUDA_VISIBLE_DEVICES are not set");
+            tracing::info!("Parsing num_shard from CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES");
+            let n_devices = num_cuda_devices()
+                .expect("--num-shard and CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES are not set");
             if n_devices <= 1 {
                 panic!("`sharded` is true but only found {n_devices} CUDA devices");
             }
@@ -671,6 +705,16 @@ fn spawn_shards(
     status_sender: mpsc::Sender<ShardStatus>,
     running: Arc<AtomicBool>,
 ) -> Result<(), LauncherError> {
+    if args.trust_remote_code {
+        tracing::warn!(
+            "`trust_remote_code` is set. Trusting that model `{}` do not contain malicious code.",
+            args.model_id
+        );
+        if args.revision.is_none() {
+            tracing::warn!("Explicitly passing a `revision` is encouraged when loading a model with custom code to ensure no malicious code has been contributed in a newer revision.");
+        }
+    }
+
     // Start shard processes
     for rank in 0..num_shard {
         let model_id = args.model_id.clone();
@@ -684,6 +728,7 @@ fn spawn_shards(
         let shutdown_sender = shutdown_sender.clone();
         let otlp_endpoint = args.otlp_endpoint.clone();
         let quantize = args.quantize;
+        let trust_remote_code = args.trust_remote_code;
         let master_port = args.master_port;
         let disable_custom_kernels = args.disable_custom_kernels;
         let watermark_gamma = args.watermark_gamma;
@@ -693,6 +738,7 @@ fn spawn_shards(
                 model_id,
                 revision,
                 quantize,
+                trust_remote_code,
                 uds_path,
                 rank,
                 num_shard,

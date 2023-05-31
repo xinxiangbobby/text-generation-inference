@@ -10,32 +10,35 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoConfig,
 )
-from transformers.models.t5.parallel_layers import (
-    TensorParallelColumnLinear,
-    TensorParallelEmbedding,
-    TensorParallelRowLinear,
-)
 
 from text_generation_server.models import Seq2SeqLM
 from text_generation_server.utils import (
     initialize_torch_distributed,
     weight_files,
 )
+from transformers.models.t5.parallel_layers import (
+    TensorParallelRowLinear,
+    TensorParallelColumnLinear,
+    TensorParallelEmbedding,
+)
 
 HAS_BITS_AND_BYTES = True
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Int8Params
-except Exception as e:
+except ImportError as e:
     HAS_BITS_AND_BYTES = False
 
 
 class T5Sharded(Seq2SeqLM):
     def __init__(
-        self, model_id: str, revision: Optional[str] = None, quantize: bool = False
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
         self.process_group, rank, world_size = initialize_torch_distributed()
-        self.master = rank == 0
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16
@@ -44,11 +47,18 @@ class T5Sharded(Seq2SeqLM):
             dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, revision=revision, padding_side="left", truncation_side="left"
+            model_id,
+            revision=revision,
+            padding_side="left",
+            truncation_side="left",
+            trust_remote_code=trust_remote_code,
         )
 
         config = AutoConfig.from_pretrained(
-            model_id, revision=revision, tp_parallel=True
+            model_id,
+            revision=revision,
+            tp_parallel=True,
+            trust_remote_code=trust_remote_code,
         )
         tokenizer.bos_token_id = config.decoder_start_token_id
 
@@ -56,7 +66,9 @@ class T5Sharded(Seq2SeqLM):
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
 
         with init_empty_weights():
-            model = AutoModelForSeq2SeqLM.from_config(config)
+            model = AutoModelForSeq2SeqLM.from_config(
+                config, trust_remote_code=trust_remote_code
+            )
 
         torch.distributed.barrier(group=self.process_group)
         self.load_weights(
@@ -68,9 +80,9 @@ class T5Sharded(Seq2SeqLM):
             rank=rank,
             world_size=world_size,
         )
-        self.model = model.eval()
         torch.distributed.barrier(group=self.process_group)
         super(Seq2SeqLM, self).__init__(
+            model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
@@ -83,7 +95,7 @@ class T5Sharded(Seq2SeqLM):
     def load_weights(
         model,
         filenames: List[str],
-        quantize: bool,
+        quantize: Optional[str],
         device: torch.device,
         dtype: torch.dtype,
         rank: int,
@@ -92,7 +104,7 @@ class T5Sharded(Seq2SeqLM):
         parameters = dict(model.named_parameters())
         for file in filenames:
             with safe_open(
-                file, framework="pt", device=str(device) if not quantize else "cpu"
+                file, framework="pt", device=str(device) if quantize is None else "cpu"
             ) as f:
                 for name in f.keys():
                     module_name, param_name = name.rsplit(".", 1)
@@ -152,9 +164,15 @@ class T5Sharded(Seq2SeqLM):
                             f"Name {name} -- Current {current_parameter_tensor.shape} and got {tensor.shape}"
                         )
 
-                    tensor = tensor.contiguous().to(dtype)
+                    tensor = tensor.contiguous()
 
-                    if quantize:
+                    # See: https://github.com/huggingface/transformers/blob/1fe1e3caa44617047f149bcc0c0b566343b714a7/src/transformers/models/t5/modeling_t5.py#LL316C15-L316C71
+                    if module_name.endswith("wo"):
+                        tensor = tensor.to(torch.float32)
+                    else:
+                        tensor = tensor.to(dtype)
+
+                    if quantize == "bitsandbytes" and not module_name.endswith("wo"):
                         if not HAS_BITS_AND_BYTES:
                             raise ImportError(
                                 "bitsandbytes is not available on your machine either because it is not installed "
@@ -205,22 +223,17 @@ class T5Sharded(Seq2SeqLM):
 
                             module.linear = replace_linear(state)
 
-                        else:
-                            tensor = tensor.to(device)
+                    elif quantize == "gptq" and not module_name.endswith("wo"):
+                        raise NotImplementedError("`gptq` is not implemented for now")
+                    elif quantize is None or module_name.endswith("wo"):
+                        tensor = tensor.to(device)
+                    else:
+                        raise ValueError(f"Unexpected quantize `{quantize}`")
 
                     if current_parameter_tensor is not None:
                         module._parameters[param_name] = tensor
                     else:
                         module._buffers[param_name] = tensor
-
-        uninitialized_parameters = []
-        for n, p in model.named_parameters():
-            if p.data.device == torch.device("meta"):
-                uninitialized_parameters.append(n)
-        if uninitialized_parameters:
-            raise RuntimeError(
-                f"found uninitialized parameters in model: {uninitialized_parameters}"
-            )
 
     def forward(
         self,

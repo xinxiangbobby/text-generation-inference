@@ -10,6 +10,7 @@ from text_generation_server.models.causal_lm import CausalLM
 from text_generation_server.models.flash_causal_lm import FlashCausalLM
 from text_generation_server.models.bloom import BLOOM, BLOOMSharded
 from text_generation_server.models.seq2seq_lm import Seq2SeqLM
+from text_generation_server.models.rw import RW
 from text_generation_server.models.opt import OPT, OPTSharded
 from text_generation_server.models.galactica import Galactica, GalacticaSharded
 from text_generation_server.models.santacoder import SantaCoder
@@ -30,6 +31,7 @@ try:
             )
 
         from text_generation_server.models.flash_neox import FlashNeoX, FlashNeoXSharded
+        from text_generation_server.models.flash_rw import FlashRW, FlashRWSharded
         from text_generation_server.models.flash_llama import (
             FlashLlama,
             FlashLlamaSharded,
@@ -68,6 +70,8 @@ __all__ = [
 if FLASH_ATTENTION:
     __all__.append(FlashNeoX)
     __all__.append(FlashNeoXSharded)
+    __all__.append(FlashRW)
+    __all__.append(FlashRWSharded)
     __all__.append(FlashSantacoder)
     __all__.append(FlashSantacoderSharded)
     __all__.append(FlashLlama)
@@ -91,69 +95,220 @@ torch.set_grad_enabled(False)
 
 
 def get_model(
-    model_id: str, revision: Optional[str], sharded: bool, quantize: bool
+    model_id: str,
+    revision: Optional[str],
+    sharded: bool,
+    quantize: Optional[str],
+    trust_remote_code: bool,
 ) -> Model:
     if "facebook/galactica" in model_id:
         if sharded:
-            return GalacticaSharded(model_id, revision, quantize=quantize)
+            return GalacticaSharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
-            return Galactica(model_id, revision, quantize=quantize)
+            return Galactica(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
-    if "bigcode" in model_id:
+    if model_id.startswith("bigcode/"):
         if sharded:
             if not FLASH_ATTENTION:
                 raise NotImplementedError(
                     FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Santacoder")
                 )
-            return FlashSantacoderSharded(model_id, revision, quantize=quantize)
+            return FlashSantacoderSharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
             santacoder_cls = FlashSantacoder if FLASH_ATTENTION else SantaCoder
-            return santacoder_cls(model_id, revision, quantize=quantize)
+            return santacoder_cls(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
-    config = AutoConfig.from_pretrained(model_id, revision=revision)
+    config = AutoConfig.from_pretrained(
+        model_id, revision=revision, trust_remote_code=trust_remote_code
+    )
     model_type = config.model_type
+
+    if model_type == "gpt_bigcode":
+        if sharded:
+            if not FLASH_ATTENTION:
+                raise NotImplementedError(
+                    FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Santacoder")
+                )
+            return FlashSantacoderSharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
+        else:
+            santacoder_cls = FlashSantacoder if FLASH_ATTENTION else SantaCoder
+            return santacoder_cls(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     if model_type == "bloom":
         if sharded:
-            return BLOOMSharded(model_id, revision, quantize=quantize)
+            return BLOOMSharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
-            return BLOOM(model_id, revision, quantize=quantize)
+            return BLOOM(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     if model_type == "gpt_neox":
         if sharded:
             neox_cls = FlashNeoXSharded if FLASH_ATTENTION else GPTNeoxSharded
-            return neox_cls(model_id, revision, quantize=quantize)
+            return neox_cls(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
             neox_cls = FlashNeoX if FLASH_ATTENTION else CausalLM
-            return neox_cls(model_id, revision, quantize=quantize)
+            return neox_cls(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
+
+    if model_type in ["RefinedWeb", "RefinedWebModel"]:
+        if sharded:
+            if FLASH_ATTENTION:
+                if config.alibi or (
+                    config.model_type == "RefinedWebModel"
+                    and config.n_head_kv != config.n_head
+                ):
+                    raise NotImplementedError("sharded is not supported for this model")
+                return FlashRWSharded(
+                    model_id,
+                    revision,
+                    quantize=quantize,
+                    trust_remote_code=trust_remote_code,
+                )
+            raise NotImplementedError(
+                FLASH_ATT_ERROR_MESSAGE.format(f"Sharded RefinedWeb")
+            )
+        else:
+            if FLASH_ATTENTION and not config.alibi:
+                return FlashRW(
+                    model_id,
+                    revision,
+                    quantize=quantize,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                return RW(
+                    model_id,
+                    revision,
+                    quantize=quantize,
+                    trust_remote_code=trust_remote_code,
+                )
 
     if model_type == "llama":
         if sharded:
             if FLASH_ATTENTION:
-                return FlashLlamaSharded(model_id, revision, quantize=quantize)
+                return FlashLlamaSharded(
+                    model_id,
+                    revision,
+                    quantize=quantize,
+                    trust_remote_code=trust_remote_code,
+                )
             raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Llama"))
         else:
             llama_cls = FlashLlama if FLASH_ATTENTION else CausalLM
-            return llama_cls(model_id, revision, quantize=quantize)
+            return llama_cls(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     if config.model_type == "opt":
         if sharded:
-            return OPTSharded(model_id, revision, quantize=quantize)
+            return OPTSharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
-            return OPT(model_id, revision, quantize=quantize)
+            return OPT(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     if model_type == "t5":
         if sharded:
-            return T5Sharded(model_id, revision, quantize=quantize)
+            return T5Sharded(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
         else:
-            return Seq2SeqLM(model_id, revision, quantize=quantize)
+            return Seq2SeqLM(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     if sharded:
         raise ValueError("sharded is not supported for AutoModel")
 
     if model_type in modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-        return CausalLM(model_id, revision, quantize=quantize)
+        return CausalLM(
+            model_id, revision, quantize=quantize, trust_remote_code=trust_remote_code
+        )
     if model_type in modeling_auto.MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES:
-        return Seq2SeqLM(model_id, revision, quantize=quantize)
+        return Seq2SeqLM(
+            model_id, revision, quantize=quantize, trust_remote_code=trust_remote_code
+        )
+
+    auto_map = getattr(config, "auto_map", None)
+    if trust_remote_code and auto_map is not None:
+        if "AutoModelForCausalLM" in auto_map.keys():
+            return CausalLM(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
+        if "AutoModelForSeq2SeqLM" in auto_map.keys():
+            return Seq2SeqLM(
+                model_id,
+                revision,
+                quantize=quantize,
+                trust_remote_code=trust_remote_code,
+            )
 
     raise ValueError(f"Unsupported model type {model_type}")

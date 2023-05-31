@@ -12,7 +12,7 @@ from text_generation_server.pb.generate_pb2 import FinishReason
 
 class Batch(ABC):
     @abstractmethod
-    def to_pb(self) -> generate_pb2.Batch:
+    def to_pb(self) -> generate_pb2.CachedBatch:
         raise NotImplementedError
 
     @classmethod
@@ -21,12 +21,13 @@ class Batch(ABC):
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        dtype: torch.dtype,
         device: torch.device,
     ) -> "Batch":
         raise NotImplementedError
 
     @abstractmethod
-    def filter(self, requests: List[generate_pb2.Request]) -> "Batch":
+    def filter(self, request_ids: List[int]) -> "Batch":
         raise NotImplementedError
 
     @classmethod

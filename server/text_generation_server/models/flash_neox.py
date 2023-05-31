@@ -23,19 +23,31 @@ tracer = trace.get_tracer(__name__)
 
 
 class FlashNeoX(FlashCausalLM):
-    def __init__(self, model_id: str, revision: Optional[str] = None, quantize=False):
+    def __init__(
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
+    ):
         super(FlashNeoX, self).__init__(
-            FlashGPTNeoXForCausalLM, model_id, revision, quantize
+            FlashGPTNeoXForCausalLM,
+            model_id,
+            revision,
+            quantize,
+            trust_remote_code=trust_remote_code,
         )
 
 
 class FlashNeoXSharded(FlashNeoX):
     def __init__(
-        self, model_id: str, revision: Optional[str] = None, quantize: bool = False
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
-        self.past_pad = None
         self.process_group, rank, world_size = initialize_torch_distributed()
-        self.master = rank == 0
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16
@@ -43,12 +55,15 @@ class FlashNeoXSharded(FlashNeoX):
             raise NotImplementedError("FlashNeoX is only available on GPU")
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, revision=revision, padding_side="left", truncation_side="left"
+            model_id,
+            revision=revision,
+            padding_side="left",
+            truncation_side="left",
+            trust_remote_code=trust_remote_code,
         )
 
         config = AutoConfig.from_pretrained(
-            model_id,
-            revision=revision,
+            model_id, revision=revision, trust_remote_code=trust_remote_code
         )
 
         torch.distributed.barrier(group=self.process_group)
@@ -67,9 +82,9 @@ class FlashNeoXSharded(FlashNeoX):
             rank=rank,
             world_size=world_size,
         )
-        self.model = model.eval().to(device)
         torch.distributed.barrier(group=self.process_group)
         super(FlashCausalLM, self).__init__(
+            model=model.to(device),
             tokenizer=tokenizer,
             requires_padding=False,
             dtype=dtype,
@@ -82,7 +97,7 @@ class FlashNeoXSharded(FlashNeoX):
     def load_weights(
         model,
         filenames: List[str],
-        quantize: bool,
+        quantize: Optional[str],
         device: torch.device,
         dtype: torch.dtype,
         rank: int,
@@ -91,7 +106,7 @@ class FlashNeoXSharded(FlashNeoX):
         parameters = dict(model.named_parameters())
         for file in filenames:
             with safe_open(
-                file, framework="pt", device=str(device) if not quantize else "cpu"
+                file, framework="pt", device=str(device) if quantize is None else "cpu"
             ) as f:
                 for name in f.keys():
                     module_name, param_name = name.rsplit(".", 1)
@@ -151,14 +166,5 @@ class FlashNeoXSharded(FlashNeoX):
                         module._parameters[param_name] = tensor
                     else:
                         module._buffers[param_name] = tensor
-
-        uninitialized_parameters = []
-        for n, p in model.named_parameters():
-            if p.data.device == torch.device("meta"):
-                uninitialized_parameters.append(n)
-        if uninitialized_parameters:
-            raise RuntimeError(
-                f"found uninitialized parameters in model: {uninitialized_parameters}"
-            )
 
         model.post_load_weights(quantize)

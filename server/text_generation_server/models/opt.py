@@ -48,10 +48,13 @@ class OPT(CausalLM):
 
 class OPTSharded(OPT):
     def __init__(
-        self, model_id: str, revision: Optional[str] = None, quantize: bool = False
+        self,
+        model_id: str,
+        revision: Optional[str] = None,
+        quantize: Optional[str] = None,
+        trust_remote_code: bool = False,
     ):
         self.process_group, rank, world_size = initialize_torch_distributed()
-        self.master = rank == 0
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16
@@ -60,11 +63,18 @@ class OPTSharded(OPT):
             dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id, revision=revision, padding_side="left", truncation_side="left"
+            model_id,
+            revision=revision,
+            padding_side="left",
+            truncation_side="left",
+            trust_remote_code=trust_remote_code,
         )
 
         config = AutoConfig.from_pretrained(
-            model_id, revision=revision, tp_parallel=True
+            model_id,
+            revision=revision,
+            tp_parallel=True,
+            trust_remote_code=trust_remote_code,
         )
         tokenizer.pad_token_id = config.pad_token_id
 
@@ -72,7 +82,9 @@ class OPTSharded(OPT):
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config)
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=trust_remote_code
+            )
 
         torch.distributed.barrier(group=self.process_group)
         self.load_weights(
@@ -84,9 +96,9 @@ class OPTSharded(OPT):
             rank=rank,
             world_size=world_size,
         )
-        self.model = model.eval()
         torch.distributed.barrier(group=self.process_group)
         super(CausalLM, self).__init__(
+            model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
@@ -99,7 +111,7 @@ class OPTSharded(OPT):
     def load_weights(
         model,
         filenames: List[str],
-        quantize: bool,
+        quantize: Optional[str],
         device: torch.device,
         dtype: torch.dtype,
         rank: int,
@@ -108,7 +120,7 @@ class OPTSharded(OPT):
         parameters = dict(model.named_parameters())
         for file in filenames:
             with safe_open(
-                file, framework="pt", device=str(device) if not quantize else "cpu"
+                file, framework="pt", device=str(device) if quantize is None else "cpu"
             ) as f:
                 for name in f.keys():
                     if name == "lm_head.weight":
@@ -211,15 +223,6 @@ class OPTSharded(OPT):
                     module._parameters[param_name] = tensor
                     if name == "model.decoder.embed_tokens.weight":
                         model.lm_head._parameters["weight"] = tensor
-
-        uninitialized_parameters = []
-        for n, p in model.named_parameters():
-            if p.data.device == torch.device("meta"):
-                uninitialized_parameters.append(n)
-        if uninitialized_parameters:
-            raise RuntimeError(
-                f"found uninitialized parameters in model: {uninitialized_parameters}"
-            )
 
     def forward(
         self, input_ids, attention_mask, position_ids, past_key_values: Optional = None

@@ -108,7 +108,7 @@ COPY server/Makefile-transformers Makefile
 RUN BUILD_EXTENSIONS="True" make build-transformers
 
 # Text Generation Inference base image
-FROM debian:bullseye-slim as base
+FROM nvidia/cuda:11.8.0-base-ubuntu20.04 as base
 
 # Conda env
 ENV PATH=/opt/conda/bin:$PATH \
@@ -117,21 +117,7 @@ ENV PATH=/opt/conda/bin:$PATH \
 # Text Generation Inference base env
 ENV HUGGINGFACE_HUB_CACHE=/data \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
-    MODEL_ID=bigscience/bloom-560m \
-    QUANTIZE=false \
-    NUM_SHARD=1 \
     PORT=80
-
-# NVIDIA env vars
-ENV NVIDIA_VISIBLE_DEVICES all
-ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-# Required for nvidia-docker v1
-RUN /bin/bash -c echo "/usr/local/nvidia/lib" >> /etc/ld.so.conf.d/nvidia.conf && \
-    echo "/usr/local/nvidia/lib64" >> /etc/ld.so.conf.d/nvidia.conf
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
-
-LABEL com.nvidia.volumes.needed="nvidia_driver"
 
 WORKDIR /usr/src
 
