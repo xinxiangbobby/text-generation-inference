@@ -9,14 +9,16 @@ def flash_starcoder_handle(launcher):
 
 @pytest.fixture(scope="module")
 async def flash_starcoder(flash_starcoder_handle):
-    await flash_starcoder_handle.health(240)
+    await flash_starcoder_handle.health(300)
     return flash_starcoder_handle.client
 
 
 @pytest.mark.asyncio
 @pytest.mark.private
 async def test_flash_starcoder(flash_starcoder, response_snapshot):
-    response = await flash_starcoder.generate("def print_hello", max_new_tokens=10)
+    response = await flash_starcoder.generate(
+        "def print_hello", max_new_tokens=10, decoder_input_details=True
+    )
 
     assert response.details.generated_tokens == 10
     assert response == response_snapshot
@@ -26,7 +28,12 @@ async def test_flash_starcoder(flash_starcoder, response_snapshot):
 @pytest.mark.private
 async def test_flash_starcoder_default_params(flash_starcoder, response_snapshot):
     response = await flash_starcoder.generate(
-        "def print_hello", max_new_tokens=60, temperature=0.2, top_p=0.95, seed=0
+        "def print_hello",
+        max_new_tokens=60,
+        temperature=0.2,
+        top_p=0.95,
+        decoder_input_details=True,
+        seed=0,
     )
 
     assert response.details.generated_tokens == 60

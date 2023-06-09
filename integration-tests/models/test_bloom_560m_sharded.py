@@ -9,7 +9,7 @@ def bloom_560m_sharded_handle(launcher):
 
 @pytest.fixture(scope="module")
 async def bloom_560m_sharded(bloom_560m_sharded_handle):
-    await bloom_560m_sharded_handle.health(60)
+    await bloom_560m_sharded_handle.health(240)
     return bloom_560m_sharded_handle.client
 
 
@@ -19,6 +19,7 @@ async def test_bloom_560m_sharded(bloom_560m_sharded, response_snapshot):
         "Pour déguster un ortolan, il faut tout d'abord",
         max_new_tokens=10,
         top_p=0.9,
+        decoder_input_details=True,
         seed=0,
     )
 

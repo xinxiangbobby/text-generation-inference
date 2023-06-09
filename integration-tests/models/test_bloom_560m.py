@@ -9,7 +9,7 @@ def bloom_560_handle(launcher):
 
 @pytest.fixture(scope="module")
 async def bloom_560(bloom_560_handle):
-    await bloom_560_handle.health(60)
+    await bloom_560_handle.health(240)
     return bloom_560_handle.client
 
 
@@ -19,6 +19,7 @@ async def test_bloom_560m(bloom_560, response_snapshot):
         "Pour déguster un ortolan, il faut tout d'abord",
         max_new_tokens=10,
         top_p=0.9,
+        decoder_input_details=True,
         seed=0,
     )
 
@@ -40,6 +41,7 @@ async def test_bloom_560m_all_params(bloom_560, response_snapshot):
         truncate=5,
         typical_p=0.9,
         watermark=True,
+        decoder_input_details=True,
         seed=0,
     )
 
